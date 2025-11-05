@@ -1,0 +1,233 @@
+#include <Adafruit_Fingerprint.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// === Wi-Fi & Firebase setup ===
+const char* ssid = "PERLA";
+const char* password = "12344321";
+String firebaseHost = "https://smart-security-a937a-default-rtdb.firebaseio.com";
+
+// === OLED ===
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET     -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// === Fingerprint sensor on Serial2 ===
+HardwareSerial mySerial(2);  // UART2
+Adafruit_Fingerprint finger(&mySerial);
+
+// === Servo & Peripherals ===
+Servo doorServo;
+const int servoPin = 18;
+const int greenLEDPin = 32;  
+const int redLEDPin = 25;    
+const int buzzerPin = 26;    
+
+bool inputMode = false;
+
+void connectToWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 20) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ Connected to WiFi");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n❌ WiFi Connection Failed");
+    while (true);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  mySerial.begin(57600, SERIAL_8N1, 14, 12);  // RX = 14, TX = 12
+
+  connectToWiFi();
+
+  // OLED INIT
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("❌ OLED not found");
+    while (true);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Smart Security System");
+  display.display();
+
+  finger.begin(57600);
+  if (finger.verifyPassword()) {
+    Serial.println("✅ Fingerprint sensor found!");
+  } else {
+    Serial.println("❌ Fingerprint sensor not found. Check wiring.");
+    while (1);
+  }
+
+  finger.getTemplateCount();
+  Serial.print("📦 Templates stored: ");
+  Serial.println(finger.templateCount);
+
+  // Peripheral setup
+  doorServo.attach(servoPin);
+  doorServo.write(0);
+  pinMode(greenLEDPin, OUTPUT);
+  pinMode(redLEDPin, OUTPUT);
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(redLEDPin, HIGH);
+
+  Serial.println("📝 Type 'input' to enter input mode, or 'enroll <id>' to enroll fingerprint");
+}
+
+void loop() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+
+    if (command == "input") {
+      inputMode = true;
+      Serial.println("📥 Entered input mode. Type p<number> or 'exit'");
+    } else if (command.startsWith("enroll ")) {
+      int id = command.substring(7).toInt();
+      enrollFingerprint(id);
+    } else if (inputMode) {
+      if (command == "exit") {
+        inputMode = false;
+        Serial.println("🚪 Exited input mode.");
+      } else if (command.startsWith("p")) {
+        int id = command.substring(1).toInt();
+        String key = "p" + String(id);
+        String timestamp = "2025-06-03T18:00:00Z";  // Static for demo
+        sendToFirebase(key, id, timestamp);
+        Serial.println("✅ Sent data for " + key);
+      } else {
+        Serial.println("❌ Invalid input. Use format p<number> or 'exit'");
+      }
+    }
+  } else {
+    if (!inputMode) checkFingerprint();
+    delay(100);
+  }
+}
+
+void checkFingerprint() {
+  uint8_t p = finger.getImage();
+  if (p != FINGERPRINT_OK) return;
+
+  p = finger.image2Tz();
+  if (p != FINGERPRINT_OK) return;
+
+  p = finger.fingerSearch();
+  if (p == FINGERPRINT_OK) {
+    Serial.print("✅ Matched ID: p");
+    Serial.println(finger.fingerID);
+    showOLED("Matched ID", "Access Granted");
+    activateDoor();
+  } else {
+    Serial.println("❌ No match found.");
+    showOLED("No Match Found", "Access Denied");
+  }
+  delay(2000);
+}
+
+void activateDoor() {
+  Serial.println("🔓 Access Granted: Opening Door");
+
+  digitalWrite(redLEDPin, LOW);
+  digitalWrite(greenLEDPin, HIGH);
+  digitalWrite(buzzerPin, HIGH);
+  doorServo.write(150); // Open
+
+  delay(3000);
+
+  doorServo.write(0); // Close
+  digitalWrite(buzzerPin, LOW);
+  digitalWrite(greenLEDPin, LOW);
+  digitalWrite(redLEDPin, HIGH);
+
+  Serial.println("🔒 Door Closed");
+}
+
+void sendToFirebase(String key, int id, String timestamp) {
+  StaticJsonDocument<200> doc;
+  doc["fingerprintID"] = id;
+  doc["timestamp"] = timestamp;
+
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+
+  HTTPClient http;
+  String url = firebaseHost + "/fingerprints/" + key + ".json";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  int httpResponseCode = http.PUT(jsonPayload);
+  Serial.print("📡 Firebase response code: ");
+  Serial.println(httpResponseCode);
+
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.println("✅ Response: " + response);
+  } else {
+    Serial.println("❌ Error sending data");
+  }
+
+  http.end();
+}
+
+void enrollFingerprint(int id) {
+  int p = -1;
+  Serial.print("🧠 Enrolling ID #"); Serial.println(id);
+
+  Serial.println("👉 Place finger...");
+  while ((p = finger.getImage()) != FINGERPRINT_OK);
+
+  p = finger.image2Tz(1);
+  if (p != FINGERPRINT_OK) { Serial.println("❌ Error #1"); return; }
+
+  Serial.println("👉 Remove finger...");
+  delay(2000);
+  while (finger.getImage() != FINGERPRINT_NOFINGER);
+
+  Serial.println("👉 Place the same finger again...");
+  while ((p = finger.getImage()) != FINGERPRINT_OK);
+
+  p = finger.image2Tz(2);
+  if (p != FINGERPRINT_OK) { Serial.println("❌ Error #2"); return; }
+
+  p = finger.createModel();
+  if (p != FINGERPRINT_OK) {
+    Serial.println("❌ Failed to create model.");
+    return;
+  }
+
+  p = finger.storeModel(id);
+  if (p == FINGERPRINT_OK) {
+    Serial.println("✅ Fingerprint enrolled successfully!");
+  } else {
+    Serial.println("❌ Failed to store fingerprint.");
+  }
+}
+
+void showOLED(String line1, String line2) {
+  display.clearDisplay();
+  display.setCursor(0, 10);
+  display.setTextSize(1);
+  display.println(line1);
+  display.setTextSize(2);
+  display.setCursor(0, 30);
+  display.println(line2);
+  display.display();
+}
